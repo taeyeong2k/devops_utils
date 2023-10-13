@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import subprocess
+import re
 import os
 import argparse
+import shutil
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization, hashes
@@ -35,73 +37,68 @@ def check_revocation(domain):
 
 def check_csr(csr_content):
     try:
-        # Load the CSR
-        csr = x509.load_pem_x509_csr(csr_content.encode(), default_backend())
+        with open("temp_csr.pem", "w") as f:
+            f.write(csr_content)
 
-        # Extract the subject details
-        subject = csr.subject
+        # Get all CSR details in text format
+        csr_text = subprocess.getoutput("openssl req -in temp_csr.pem -text -noout")
+
+        # Define regex patterns for extracting information
+        subject_pattern = r"Subject: (.+)"
+        public_key_pattern = r"Public Key Algorithm: (.+)"
+        san_pattern = r"X509v3 Subject Alternative Name: \n +([^\n]+)"
+
+        # Extract details using regex
+        subject = re.search(subject_pattern, csr_text).group(1)
+        public_key_algo = re.search(public_key_pattern, csr_text).group(1)
+        san = re.search(san_pattern, csr_text).group(1) if re.search(san_pattern, csr_text) else "No Subject Alternative Names found."
+
+        # Print extracted details
         print(f"Subject: {subject}")
-
-        # Extract and properly serialize the public key
-        public_key = csr.public_key()
-        serialized_public_key = public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        ).decode('utf-8')
-        print(f"\nPublic Key: \n {serialized_public_key}")
-
-        # Extract the extensions
-        extensions = csr.extensions
-
-        # Subject Alternative Names
-        try:
-            san = extensions.get_extension_for_class(x509.SubjectAlternativeName)
-            print(f"Subject Alternative Names: {san.value.get_values_for_type(x509.DNSName)}")
-        except x509.ExtensionNotFound:
-            print("No Subject Alternative Names found.")
+        print(f"Public Key Algorithm: {public_key_algo}")
+        print(f"Subject Alternative Names: {san}")
 
     except Exception as e:
         print(f"An exception occurred: {e}")
+
+    finally:
+        subprocess.run(["rm", "temp_csr.pem"])
 
 def decode_cert(cert_content):
     try:
-        # Load the certificate
-        cert = x509.load_pem_x509_certificate(cert_content.encode(), default_backend())
+        with open("temp_cert.pem", "w") as f:
+            f.write(cert_content)
 
-        # Extract the issuer details
-        issuer = cert.issuer
+        # Get all certificate details in text format
+        cert_text = subprocess.getoutput("openssl x509 -in temp_cert.pem -text -noout")
+
+        # Define regex patterns for extracting information
+        issuer_pattern = r"Issuer: (.+)"
+        subject_pattern = r"Subject: (.+)"
+        validity_pattern = r"Not Before: (.+), Not After : (.+)"
+        public_key_pattern = r"Public Key Algorithm: (.+)"
+        san_pattern = r"X509v3 Subject Alternative Name: \n +([^\n]+)"
+
+        # Extract details using regex
+        issuer = re.search(issuer_pattern, cert_text).group(1)
+        subject = re.search(subject_pattern, cert_text).group(1)
+        not_before, not_after = re.search(validity_pattern, cert_text).groups()
+        public_key_algo = re.search(public_key_pattern, cert_text).group(1)
+        san = re.search(san_pattern, cert_text).group(1) if re.search(san_pattern, cert_text) else "No Subject Alternative Names found."
+
+        # Print extracted details
         print(f"Issuer: {issuer}")
-
-        # Extract the subject details
-        subject = cert.subject
         print(f"Subject: {subject}")
-
-        # Extract and properly serialize the public key
-        public_key = cert.public_key()
-        serialized_public_key = public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        ).decode('utf-8')
-        print(f"Public Key: {serialized_public_key}")
-
-        # Extract the validity period
-        not_before = cert.not_valid_before
-        not_after = cert.not_valid_after
+        print(f"Public Key Algorithm: {public_key_algo}")
         print(f"Valid From: {not_before}")
         print(f"Valid To: {not_after}")
-
-        # Extract the extensions
-        extensions = cert.extensions
-
-        # Subject Alternative Names
-        try:
-            san = extensions.get_extension_for_class(x509.SubjectAlternativeName)
-            print(f"Subject Alternative Names: {san.value.get_values_for_type(x509.DNSName)}")
-        except x509.ExtensionNotFound:
-            print("No Subject Alternative Names found.")
+        print(f"Subject Alternative Names: {san}")
 
     except Exception as e:
         print(f"An exception occurred: {e}")
+
+    finally:
+        subprocess.run(["rm", "temp_cert.pem"])
 
 def read_file_content(file_path):
     with open(file_path, 'r') as f:
@@ -109,26 +106,29 @@ def read_file_content(file_path):
 
 def verify_cert_chain(chain_path):
     try:
-        chain_content = read_file_content(chain_path)
+        # Check if the 'temp_chain.pem' file already exists; if so, remove it
+        if shutil.which("temp_chain.pem"):
+            subprocess.run(["rm", "temp_chain.pem"])
 
-        # Split the certificates and explicitly add back the '-----END CERTIFICATE-----' part
-        raw_certs = chain_content.strip().split('-----END CERTIFICATE-----')
-        certs = [x509.load_pem_x509_certificate((cert + '-----END CERTIFICATE-----').encode(), default_backend())
-                 for cert in raw_certs if cert.strip()]
+        # Copy the original chain file to a temporary file for manipulation
+        shutil.copy(chain_path, "temp_chain.pem")
 
+        # Verify the certificate chain using OpenSSL
+        result = subprocess.run(["openssl", "verify", "-CAfile", "temp_chain.pem", "temp_chain.pem"], capture_output=True, text=True)
 
-        for i in range(len(certs) - 1):
-            issuer = certs[i].issuer
-            subject = certs[i + 1].subject
-            if issuer != subject:
-                print(f"The issuer of certificate {i+1} does not match the subject of certificate {i+2}")
-                return False
+        if "OK" in result.stdout:
             print("Certificate chain is valid.")
-        return True
+            return True
+        else:
+            print(f"Certificate chain is invalid: {result.stderr}")
+            return False
 
     except Exception as e:
         print(f"An exception occurred: {e}")
         return False
+
+    finally:
+        subprocess.run(["rm", "temp_chain.pem"])
 
 def verify_key_certificate_match(private_key, certificate):
 
